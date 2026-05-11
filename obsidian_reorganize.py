@@ -156,23 +156,43 @@ DEFAULT_CYBER_DOMAINS = {
                                                      'data masking'],
 }
 
+DEFAULT_FOLDER_RULES = {
+    'exclude': [],
+    'rename': {},
+    'depth': 'top',
+}
+
 TAXONOMY_FILE = Path(__file__).parent / 'taxonomy.json'
 
 
 def load_taxonomy(reset: bool = False):
     if reset or not TAXONOMY_FILE.exists():
-        data = {'primary_topics': DEFAULT_PRIMARY_TOPICS,
-                'cyber_domains' : DEFAULT_CYBER_DOMAINS}
+        data = {
+            'primary_topics': DEFAULT_PRIMARY_TOPICS,
+            'cyber_domains': DEFAULT_CYBER_DOMAINS,
+            'folder_rules': DEFAULT_FOLDER_RULES,
+        }
         TAXONOMY_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False),
                                  encoding='utf-8')
         print(f'Wrote default taxonomy to: {TAXONOMY_FILE}')
         print('Edit that file to rename topics, add domains, or tweak keywords.\n')
     data = json.loads(TAXONOMY_FILE.read_text(encoding='utf-8'))
-    return data['primary_topics'], data['cyber_domains']
+    folder_rules = data.get('folder_rules', {}) or {}
+    raw_depth = folder_rules.get('depth', 'top')
+    folder_rules = {
+        'exclude': folder_rules.get('exclude', []) or [],
+        'rename':  folder_rules.get('rename', {}) or {},
+        'depth':   raw_depth if raw_depth in ('top', 'all') else 'top',
+    }
+    return data['primary_topics'], data['cyber_domains'], folder_rules
 
 
-def save_taxonomy(primary_topics, cyber_domains):
-    data = {'primary_topics': primary_topics, 'cyber_domains': cyber_domains}
+def save_taxonomy(primary_topics, cyber_domains, folder_rules):
+    data = {
+        'primary_topics': primary_topics,
+        'cyber_domains': cyber_domains,
+        'folder_rules': folder_rules,
+    }
     TAXONOMY_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False),
                              encoding='utf-8')
 
@@ -336,9 +356,23 @@ def assign_primary(text_lower: str, primary_topics):
     return best
 
 
-def assign_domains(text_lower: str, cyber_domains):
-    return [d for d, kws in cyber_domains.items()
-            if score_keywords(text_lower, kws) > 0]
+def assign_domains(text_lower: str, cyber_domains, single_domain: bool = False):
+    best = None
+    best_score = 0
+    matches = []
+    for d, kws in cyber_domains.items():
+        score = score_keywords(text_lower, kws)
+        if score > 0:
+            matches.append(d)
+            if score > best_score:
+                best = d
+                best_score = score
+
+    if not single_domain:
+        return matches
+    if best_score == 0:
+        return []
+    return [best]
 
 
 # =============================================================================
@@ -374,6 +408,41 @@ def upsert_list_in_frontmatter(fm: str, key: str, values) -> str:
 
     lines.append(f'{key}: [{", ".join(values)}]')
     return '\n'.join(lines)
+
+
+def add_domain_tag_to_path(path: Path, domain: str, make_sidecars: bool = True) -> bool:
+    """Add a domain slug to a file (md or pdf/docx sidecar). Returns True if changed."""
+    domain_slug = slugify(domain)
+    if path.suffix.lower() == '.md':
+        fm, body = read_md(path)
+        new_fm = upsert_list_in_frontmatter(fm, 'domains', [domain_slug])
+        if new_fm != fm:
+            write_md(path, new_fm, body)
+            return True
+        return False
+
+    if path.suffix.lower() in ('.pdf', '.docx'):
+        if not make_sidecars:
+            return False
+        side = sidecar_path(path)
+        if side.exists():
+            fm, body = read_md(side)
+        else:
+            fm, body = '', ''
+        new_fm = upsert_list_in_frontmatter(fm, 'domains', [domain_slug])
+        new_fm = upsert_list_in_frontmatter(new_fm, 'source', [path.name])
+        if side.exists() and new_fm == fm:
+            return False
+        if not body.strip():
+            body = (
+                f'# {path.stem}\n\n'
+                f'_Index for `{path.name}`._\n\n'
+                f'![[{path.name}]]\n'
+            )
+        write_md(side, new_fm, body)
+        return True
+
+    return False
 
 
 def remove_known_from_tags(fm: str, known_slugs: set) -> str:
@@ -470,18 +539,87 @@ def build_haystack(path: Path) -> str:
     return f' {path.stem} '.lower()
 
 
+def _norm(s: str) -> str:
+    return (s or '').strip().lower()
+
+
+def folder_parts(path: Path, vault: Path, depth: str) -> list:
+    rel = path.relative_to(vault)
+    parts = list(rel.parent.parts)
+    return parts[:1]
+
+
+def folder_tag_slugs(path: Path, vault: Path, folder_rules) -> list:
+    """Return unique, slugified parent folder names for a file."""
+    depth = folder_rules.get('depth', 'all')
+    exclude = {_norm(x) for x in folder_rules.get('exclude', [])}
+    rename = { _norm(k): v for k, v in (folder_rules.get('rename', {}) or {}).items() }
+
+    out = []
+    for part in folder_parts(path, vault, depth):
+        if not part or part.startswith('.') or part.startswith('_'):
+            continue
+        if _norm(part) in exclude:
+            continue
+        tag_source = rename.get(_norm(part), part)
+        slug = slugify(tag_source)
+        if slug == 'untitled':
+            continue
+        if slug not in out:
+            out.append(slug)
+    return out
+
+
+def list_folder_counts(files, vault: Path, folder_rules) -> dict:
+    depth = folder_rules.get('depth', 'all')
+    exclude = {_norm(x) for x in folder_rules.get('exclude', [])}
+    counts = {}
+    for p in files:
+        for part in folder_parts(p, vault, depth):
+            if not part or part.startswith('.') or part.startswith('_'):
+                continue
+            if _norm(part) in exclude:
+                continue
+            name = part.strip()
+            if not name:
+                continue
+            counts[name] = counts.get(name, 0) + 1
+    return dict(sorted(counts.items(), key=lambda x: (-x[1], x[0].lower())))
+
+
+def suggest_folder_domains(files, vault: Path, cyber_domains, folder_rules) -> dict:
+    existing = {k.lower() for k in cyber_domains}
+    counts = list_folder_counts(files, vault, folder_rules)
+    return {k: v for k, v in counts.items() if k.lower() not in existing}
+
+
 # =============================================================================
 # CLEAN mode
 # =============================================================================
 
-def do_clean(vault: Path, cyber_root: Path, primary_topics, cyber_domains, apply: bool):
+def _check_cancel(cancel_event) -> bool:
+    if cancel_event and cancel_event.is_set():
+        print('\nCanceled by user.')
+        return True
+    return False
+
+
+def do_clean(vault: Path, cyber_root: Path, primary_topics, cyber_domains,
+             folder_rules, apply: bool, remove_folder_tags: bool,
+             cancel_event=None):
     known_topic_slugs = {slugify(k) for k in primary_topics}
     known_domain_slugs = {slugify(k) for k in cyber_domains}
-    all_known = known_topic_slugs | known_domain_slugs
+    folder_slugs = set()
+    if remove_folder_tags:
+        for p in discover(vault, cyber_root):
+            folder_slugs.update(folder_tag_slugs(p, vault, folder_rules))
+    all_known = known_topic_slugs | known_domain_slugs | folder_slugs
 
     md_to_strip = []
     sidecars_to_delete = []
     for p in vault.rglob('*'):
+        if _check_cancel(cancel_event):
+            return
         if not p.is_file() or cyber_root in p.parents:
             continue
         if p.suffix.lower() != '.md':
@@ -499,6 +637,8 @@ def do_clean(vault: Path, cyber_root: Path, primary_topics, cyber_domains, apply
     print('=' * 72)
     print(f'\nWill strip auto-block, our tag slugs, and our `domains:` line from')
     print(f'{len(md_to_strip)} .md file(s).')
+    if remove_folder_tags:
+        print('Also removing folder-based tag slugs from `tags:`.')
     print(f'\nWill delete {len(sidecars_to_delete)} sidecar(s) (*.index.md):')
     for p in sidecars_to_delete[:10]:
         print(f'   - {p.relative_to(vault)}')
@@ -513,18 +653,25 @@ def do_clean(vault: Path, cyber_root: Path, primary_topics, cyber_domains, apply
         print('\nDry-run only. Re-run with --clean --apply to actually remove.')
         return
 
+    if _check_cancel(cancel_event):
+        return
+
     # backup
     backup = vault.parent / f'{vault.name}_backup_{datetime.now():%Y%m%d_%H%M%S}'
     shutil.copytree(vault, backup)
     print(f'\nBackup created: {backup}')
 
     for p in md_to_strip:
+        if _check_cancel(cancel_event):
+            return
         fm, body = read_md(p)
         body = AUTO_BLOCK_RE.sub('', body).rstrip() + '\n'
         fm = remove_known_from_tags(fm, all_known)
         fm = remove_line(fm, 'domains')
         write_md(p, fm, body)
     for p in sidecars_to_delete:
+        if _check_cancel(cancel_event):
+            return
         p.unlink()
     if moc.exists():
         moc.unlink()
@@ -533,11 +680,67 @@ def do_clean(vault: Path, cyber_root: Path, primary_topics, cyber_domains, apply
     print('Cleanup done.')
 
 
+def remove_folder_tags_from_notes(vault: Path, cyber_root: Path, slugs: list, apply: bool):
+    if not slugs:
+        print('No folder tag slugs provided.')
+        return
+    md_files = [p for p in vault.rglob('*.md') if cyber_root not in p.parents]
+    targets = []
+    for p in md_files:
+        fm, body = read_md(p)
+        new_fm = remove_known_from_tags(fm, set(slugs))
+        if new_fm != fm:
+            targets.append((p, new_fm, body))
+
+    print('=' * 72)
+    print('REMOVE FOLDER TAGS')
+    print('=' * 72)
+    print(f'Will remove {len(slugs)} tag(s) from {len(targets)} file(s).')
+    for p, _, _ in targets[:10]:
+        print(f'   - {p.relative_to(vault)}')
+    if len(targets) > 10:
+        print(f'   ... and {len(targets) - 10} more')
+
+    if not apply:
+        print('\nDry-run only. Re-run with --apply to write changes.')
+        return
+
+    backup = vault.parent / f'{vault.name}_backup_{datetime.now():%Y%m%d_%H%M%S}'
+    shutil.copytree(vault, backup)
+    print(f'\nBackup created: {backup}')
+
+    for p, new_fm, body in targets:
+        write_md(p, new_fm, body)
+    print('Folder tag removal done.')
+
+
+def apply_domain_to_files(vault: Path, file_paths: list, domain: str,
+                          make_sidecars: bool = True) -> dict:
+    """Apply a single domain tag to a list of vault-relative file paths."""
+    changed = 0
+    skipped = 0
+    for rel in file_paths:
+        try:
+            path = (vault / rel).resolve()
+        except Exception:
+            skipped += 1
+            continue
+        if not path.exists() or not path.is_file():
+            skipped += 1
+            continue
+        if add_domain_tag_to_path(path, domain, make_sidecars):
+            changed += 1
+        else:
+            skipped += 1
+    return {'changed': changed, 'skipped': skipped}
+
+
 # =============================================================================
 # APPLY mode
 # =============================================================================
 
-def write_md_note(path: Path, primary, domains, related_lines, primary_topics, cyber_domains):
+def write_md_note(path: Path, primary, domains, related_lines, folder_tags,
+                  primary_topics, cyber_domains):
     """Rewrite a .md note: refresh tags/domains in frontmatter and the auto block."""
     fm, body = read_md(path)
     body = AUTO_BLOCK_RE.sub('', body).rstrip()
@@ -551,14 +754,17 @@ def write_md_note(path: Path, primary, domains, related_lines, primary_topics, c
     block += ['', AUTO_END]
 
     new_body = body + '\n\n---\n\n' + '\n'.join(block) + '\n'
-    fm = upsert_list_in_frontmatter(fm, 'tags', [slugify(primary)])
+    tags = [slugify(primary)] + (folder_tags or [])
+    fm = upsert_list_in_frontmatter(fm, 'tags', tags)
     fm = upsert_list_in_frontmatter(fm, 'domains', [slugify(d) for d in domains])
     write_md(path, fm, new_body)
 
 
-def write_sidecar(side: Path, source: Path, primary, domains, related_lines):
+def write_sidecar(side: Path, source: Path, primary, domains, related_lines,
+                  folder_tags):
     """Sidecar index for a PDF/DOCX with embed + tags + Related."""
-    fm = upsert_list_in_frontmatter('', 'tags', [slugify(primary)])
+    tags = [slugify(primary)] + (folder_tags or [])
+    fm = upsert_list_in_frontmatter('', 'tags', tags)
     fm = upsert_list_in_frontmatter(fm, 'domains', [slugify(d) for d in domains])
     fm = upsert_list_in_frontmatter(fm, 'source', [source.name])
 
@@ -588,8 +794,9 @@ def link_for(note) -> str:
 
 
 def do_apply(vault: Path, cyber_root: Path, primary_topics, cyber_domains,
-             top_k: int, threshold: float, make_sidecars: bool, apply: bool,
-             cyber_folder_name: str):
+             folder_rules, top_k: int, threshold: float, make_sidecars: bool,
+             apply: bool, cyber_folder_name: str, add_folder_tags: bool,
+             suggest_domains: bool, single_domain: bool, cancel_event=None):
 
     files = list(discover(vault, cyber_root))
     if not files:
@@ -599,11 +806,15 @@ def do_apply(vault: Path, cyber_root: Path, primary_topics, cyber_domains,
     print(f'Scanning {len(files)} file(s)...')
     notes = []
     for p in files:
+        if _check_cancel(cancel_event):
+            return
         haystack = build_haystack(p)
         primary  = assign_primary(haystack, primary_topics)
-        domains  = assign_domains(haystack, cyber_domains)
+        domains  = assign_domains(haystack, cyber_domains, single_domain)
+        folder_tags = folder_tag_slugs(p, vault, folder_rules) if add_folder_tags else []
         notes.append({'path': p, 'haystack': haystack,
-                      'primary': primary, 'domains': domains})
+                      'primary': primary, 'domains': domains,
+                      'folder_tags': folder_tags})
 
     by_primary = defaultdict(list)
     by_domain  = defaultdict(list)
@@ -620,10 +831,21 @@ def do_apply(vault: Path, cyber_root: Path, primary_topics, cyber_domains,
     sim = cosine_similarity(X)
     related_idx = []
     for i in range(sim.shape[0]):
+        if _check_cancel(cancel_event):
+            return
         sim[i, i] = -1
         idx = sim[i].argsort()[::-1][:top_k]
         idx = [j for j in idx if sim[i, j] >= threshold]
         related_idx.append(idx)
+
+    if suggest_domains:
+        suggestions = suggest_folder_domains(files, vault, cyber_domains, folder_rules)
+        print(f'\n{"=" * 72}\nFOLDER DOMAIN SUGGESTIONS\n{"=" * 72}')
+        if suggestions:
+            for name, count in suggestions.items():
+                print(f'  - {name}  ({count} file(s))')
+        else:
+            print('  (no new folder names found)')
 
     # ---- print plan ---------------------------------------------------------
     print(f'\n{"=" * 72}\nPRIMARY TOPIC PLAN\n{"=" * 72}')
@@ -657,6 +879,9 @@ def do_apply(vault: Path, cyber_root: Path, primary_topics, cyber_domains,
         print('\nDry-run only. Re-run with --apply to write changes.')
         return
 
+    if _check_cancel(cancel_event):
+        return
+
     # ---- backup -------------------------------------------------------------
     backup = vault.parent / f'{vault.name}_backup_{datetime.now():%Y%m%d_%H%M%S}'
     shutil.copytree(vault, backup)
@@ -664,13 +889,17 @@ def do_apply(vault: Path, cyber_root: Path, primary_topics, cyber_domains,
 
     # ---- write each note / sidecar ------------------------------------------
     for i, note in enumerate(notes):
+        if _check_cancel(cancel_event):
+            return
         related = [link_for(notes[j]) for j in related_idx[i]]
         if note['path'].suffix.lower() == '.md':
             write_md_note(note['path'], note['primary'], note['domains'], related,
+                          note['folder_tags'],
                           primary_topics, cyber_domains)
         elif make_sidecars:
             write_sidecar(sidecar_path(note['path']), note['path'],
-                          note['primary'], note['domains'], related)
+                          note['primary'], note['domains'], related,
+                          note['folder_tags'])
 
     # ---- main MOC -----------------------------------------------------------
     moc = vault / 'MOC.md'
@@ -705,12 +934,16 @@ def do_apply(vault: Path, cyber_root: Path, primary_topics, cyber_domains,
                    'Files appear in every domain they match. '
                    'See also [[../MOC|Main MOC]].', '']
     for domain in cyber_domains:
+        if _check_cancel(cancel_event):
+            return
         ns = by_domain.get(domain, [])
         if not ns:
             continue
         folder = cyber_root / safe_folder_name(domain)
         folder.mkdir(exist_ok=True)
         for n in ns:
+            if _check_cancel(cancel_event):
+                return
             try:
                 shutil.copy2(n['path'], folder / n['path'].name)
             except Exception as e:
@@ -747,6 +980,29 @@ def main():
     ap.add_argument('--threshold', type=float, default=0.10)
     ap.add_argument('--cyber-folder', default='cyber domains',
                     help='Folder name (under the vault) for domain copies.')
+    ap.add_argument('--folder-tags', action='store_true',
+                    help='Add parent folder names as tag slugs.')
+    ap.add_argument('--suggest-folder-domains', action='store_true',
+                    help='Print folder names not present in cyber domains.')
+    ap.add_argument('--single-domain', action='store_true',
+                    help='Assign at most one cyber domain (highest score).')
+    ap.add_argument('--folder-depth', choices=['all', 'top'],
+                    help='Use all parent folders or only the top-level folder.')
+    ap.add_argument('--list-folders', action='store_true',
+                    help='List detected folders and counts, then exit.')
+    ap.add_argument('--add-folder-domains', nargs='*',
+                    help='Add folder names as cyber domains. If empty, add all detected.')
+    ap.add_argument('--exclude-folder-tag', action='append', metavar='NAME',
+                    help='Exclude a folder name from folder-based tags. Can be repeated.')
+    ap.add_argument('--rename-folder-tag', nargs=2, action='append',
+                    metavar=('OLD', 'NEW'),
+                    help='Rename a folder-based tag. Can be repeated.')
+    ap.add_argument('--clear-folder-tag-rules', action='store_true',
+                    help='Clear folder tag rename/exclude rules.')
+    ap.add_argument('--remove-folder-tags', action='store_true',
+                    help='Remove all folder-based tag slugs from notes.')
+    ap.add_argument('--remove-folder-tag', action='append', metavar='NAME',
+                    help='Remove a specific folder tag slug from notes. Can be repeated.')
     ap.add_argument('--list-taxonomy', action='store_true',
                     help='Print current taxonomy.json and exit.')
     ap.add_argument('--reset-taxonomy', action='store_true',
@@ -768,7 +1024,7 @@ def main():
         load_taxonomy(reset=True)
         return
 
-    primary_topics, cyber_domains = load_taxonomy()
+    primary_topics, cyber_domains, folder_rules = load_taxonomy()
 
     if args.list_taxonomy:
         print(f'Taxonomy file: {TAXONOMY_FILE}\n')
@@ -778,17 +1034,49 @@ def main():
         print('\nCYBER DOMAINS  (multi-label, become folders):')
         for k, v in cyber_domains.items():
             print(f'  - {k}   [{len(v)} keywords]')
+        print('\nFOLDER RULES:')
+        print(f'  - depth: {folder_rules.get("depth", "all")}')
+        print(f'  - excluded: {len(folder_rules.get("exclude", []))}')
+        print(f'  - renamed: {len(folder_rules.get("rename", {}))}')
         return
 
     # --- keyword edits (modify taxonomy.json) --------------------------------
+    folder_rules_changed = False
+
+    if args.clear_folder_tag_rules:
+        folder_rules['exclude'] = []
+        folder_rules['rename'] = {}
+        folder_rules_changed = True
+
+    if args.exclude_folder_tag:
+        for name in args.exclude_folder_tag:
+            if name not in folder_rules['exclude']:
+                folder_rules['exclude'].append(name)
+                folder_rules_changed = True
+
+    if args.rename_folder_tag:
+        for old, new in args.rename_folder_tag:
+            folder_rules['rename'][old] = new
+        folder_rules_changed = True
+
+    if args.folder_depth:
+        folder_rules['depth'] = args.folder_depth
+        folder_rules_changed = True
+
     if args.add_keyword or args.remove_keyword or args.show_keywords:
         changed = edit_keywords(primary_topics, cyber_domains,
                                 args.add_keyword, args.remove_keyword,
                                 args.show_keywords)
         if changed:
-            save_taxonomy(primary_topics, cyber_domains)
+            save_taxonomy(primary_topics, cyber_domains, folder_rules)
             print(f'\nSaved: {TAXONOMY_FILE}')
         # If only keyword commands were requested (no vault), exit here.
+        if not args.vault:
+            return
+
+    if folder_rules_changed:
+        save_taxonomy(primary_topics, cyber_domains, folder_rules)
+        print(f'\nSaved: {TAXONOMY_FILE}')
         if not args.vault:
             return
 
@@ -802,12 +1090,56 @@ def main():
         sys.exit(1)
     cyber_root = vault / args.cyber_folder
 
+    if args.list_folders:
+        files = list(discover(vault, cyber_root))
+        counts = list_folder_counts(files, vault, folder_rules)
+        print(f'\nDetected folders (depth={folder_rules.get("depth", "all")})')
+        if counts:
+            for name, count in counts.items():
+                print(f'  - {name}  ({count} file(s))')
+        else:
+            print('  (no folders found)')
+        return
+
+    if args.add_folder_domains is not None:
+        files = list(discover(vault, cyber_root))
+        counts = suggest_folder_domains(files, vault, cyber_domains, folder_rules)
+        to_add = args.add_folder_domains or list(counts.keys())
+        added = []
+        for name in to_add:
+            if name not in cyber_domains:
+                cyber_domains[name] = []
+                added.append(name)
+        if added:
+            save_taxonomy(primary_topics, cyber_domains, folder_rules)
+            print(f'Added {len(added)} domain(s) from folders.')
+            print(f'Saved: {TAXONOMY_FILE}')
+        else:
+            print('No new folder domains to add.')
+
+    if args.remove_folder_tags or args.remove_folder_tag:
+        to_remove = []
+        if args.remove_folder_tags:
+            files = list(discover(vault, cyber_root))
+            slug_set = set()
+            for p in files:
+                slug_set.update(folder_tag_slugs(p, vault, folder_rules))
+            to_remove = sorted(slug_set)
+        if args.remove_folder_tag:
+            to_remove += [slugify(x) for x in args.remove_folder_tag]
+        to_remove = sorted({s for s in to_remove if s})
+        remove_folder_tags_from_notes(vault, cyber_root, to_remove, args.apply)
+        return
+
     if args.clean:
-        do_clean(vault, cyber_root, primary_topics, cyber_domains, args.apply)
+        do_clean(vault, cyber_root, primary_topics, cyber_domains,
+                 folder_rules, args.apply, args.folder_tags)
     else:
         do_apply(vault, cyber_root, primary_topics, cyber_domains,
-                 args.top_k_related, args.threshold,
-                 not args.no_sidecars, args.apply, args.cyber_folder)
+                 folder_rules, args.top_k_related, args.threshold,
+                 not args.no_sidecars, args.apply, args.cyber_folder,
+                 args.folder_tags, args.suggest_folder_domains,
+                 args.single_domain)
 
 
 if __name__ == '__main__':

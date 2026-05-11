@@ -6,13 +6,8 @@
       "debian",
       "kali",
       "bash",
-      " apt ",
-      " yum",
-      " dnf",
-      "grep ",
-      " sed ",
-      " awk ",
-      " sudo"
+      "shell",
+      "terminal"
     ],
     "Windows": [
       "windows",
@@ -21,91 +16,55 @@
       "win 10",
       "win 11",
       "powershell",
-      " ad ",
-      "active-directory",
-      " gpo "
+      "active-directory"
     ],
     "Network": [
       "network",
       "networking",
-      " tcp",
-      "udp ",
-      " ip ",
-      " dns",
-      "dhcp",
-      "vlan",
       "subnet",
       "routing",
       "router",
       "switch",
-      "firewall",
-      "vpn ",
-      " ospf",
-      " bgp",
-      " nat ",
-      "wireshark",
-      "osi model",
-      " ftp ",
-      " ssh "
+      "vpn",
+      "osi model"
     ],
     "Cloud": [
       "cloud",
-      " aws",
+      "aws",
       "amazon web services",
-      " azure",
-      " gcp",
+      "azure",
       "google cloud",
-      " ec2",
-      " s3 ",
-      "lambda ",
-      " k8s",
-      "cloudformation",
-      " vpc",
-      " eks",
-      " aks",
-      " gke"
+      "s3",
+      "cloudformation"
     ],
     "HTU Camp": [
       "htu",
-      "htu camp"
+      "htu camp",
+      "HTU bootcamp"
     ],
     "Docker": [
       "docker",
       "dockerfile",
       "docker compose",
-      "docker-compose",
-      "container image",
-      "containerization",
       "docker hub"
     ],
     "Tools": [
-      "toolkit",
-      "utility",
-      "cheatsheet",
-      "cheat sheet",
-      "reference card",
-      "tool collection"
+      "tools",
+      "tool"
     ],
     "Notion": [
-      "notion",
-      "notion.so"
+      "notion"
     ],
     "N8N": [
       " n8n ",
       "workflow automation",
       "no-code automation",
-      "low-code automation"
+      "automation"
     ],
     "Certificates": [
       "certificate",
       "certification",
-      "certified",
-      " ceh ",
-      " oscp",
-      "sec+ ",
-      "sans ",
-      " giac",
-      " gpen"
+      "certified"
     ],
     "Red Team": [
       "red team",
@@ -114,8 +73,7 @@
       "penetration test",
       "pentest",
       "pen test",
-      "attack chain",
-      " c2 "
+      "attack chain"
     ],
     "Blue Team": [
       "blue team",
@@ -123,23 +81,16 @@
       "defensive",
       "defender",
       " siem",
-      " edr",
-      " xdr",
       "threat hunt"
     ],
     "DFIR": [
-      " dfir",
+      "dfir",
       "forensic",
       "forensics",
       "incident response",
       "memory analysis",
       "disk image",
-      "volatility",
-      "autopsy",
-      "timeline analysis",
-      " ir ",
-      "triage",
-      "chain of custody"
+      "timeline analysis"
     ],
     "SOC": [
       " soc ",
@@ -149,7 +100,6 @@
       "tier 2",
       "tier-1",
       "tier-2",
-      "alert triage",
       "playbook",
       "runbook"
     ],
@@ -157,20 +107,20 @@
       "iso 27001",
       "iso27001",
       "iso-27001",
-      " isms",
-      "annex a",
-      "statement of applicability"
+      "information security management system",
+      "GRC",
+      "governance",
+      "risk",
+      "compliance"
     ],
     "AI LLM Security": [
       " ai ",
       "artificial intelligence",
       " llm",
       "large language model",
-      " gpt",
       "jailbreak",
       " mcp ",
       "model context protocol",
-      " rag ",
       "prompt engineering",
       "ai security"
     ],
@@ -190,7 +140,6 @@
     "Projects": [
       "my project",
       "side project",
-      "build log",
       "project plan",
       "project notes"
     ]
@@ -243,9 +192,6 @@
       "cryptography",
       "encryption",
       "hashing",
-      " pki ",
-      " hsm",
-      " tpm",
       "zero trust",
       "defense in depth",
       "reference architecture"
@@ -387,6 +333,13 @@
       "data leak",
       "sensitive data",
       "data masking"
-    ]
+    ],
+    "CTF": [],
+    "coding": []
+  },
+  "folder_rules": {
+    "exclude": [],
+    "rename": {},
+    "depth": "top"
   }
 }

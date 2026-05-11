@@ -1,69 +1,69 @@
-# Obsidian Vault Reorganizer
+# BMT Vault Reorganizer
 
-A local toolset for organizing an Obsidian vault using a keyword taxonomy. It can:
-- Classify notes into a single primary topic and multiple domains.
-- Add frontmatter tags and a Related section to notes.
-- Generate MOCs (Map of Content) and domain folders.
-- Handle PDF/DOCX files via sidecar index notes.
-- Provide a lightweight local dashboard for running and editing taxonomy.
+Organize your Obsidian vault using a keyword taxonomy. Classifies notes, adds tags, builds MOCs, and manages cyber-security domains — all locally.
 
-## Project files
-- `obsidian_reorganize.py`: Taxonomy Edition v2 (CLI + taxonomy.json support).
-- `obsidian_reorganize2.py`: Older taxonomy CLI (kept for reference).
-- `dashboard.py`: Local Flask UI for the v2 reorganizer.
-- `taxonomy.json`: Editable taxonomy (written on first run or via reset).
-- `dashboard_config.json`: Saved UI settings.
+---
 
-## Requirements
-- Python 3.9+ recommended.
-- Dependencies:
-  - `scikit-learn`
-  - `numpy`
-  - `pypdf` (or `PyPDF2`)
-  - `python-docx`
-  - `flask` (dashboard only)
+## Install
 
-Install:
 ```bash
 pip install scikit-learn numpy pypdf python-docx flask
 ```
 
-## CLI usage (v2)
-Dry-run by default. Use `--apply` to write changes.
+---
 
-```bash
-python obsidian_reorganize.py "D:\\path\\to\\vault"
-python obsidian_reorganize.py "D:\\path\\to\\vault" --apply
-python obsidian_reorganize.py "D:\\path\\to\\vault" --clean
-python obsidian_reorganize.py "D:\\path\\to\\vault" --clean --apply
-python obsidian_reorganize.py --list-taxonomy
-python obsidian_reorganize.py --reset-taxonomy
-```
-
-## Dashboard usage
-The dashboard runs locally and calls the v2 script under the hood.
+## Run the Dashboard
 
 ```bash
 python dashboard.py
 ```
 
-Open http://127.0.0.1:5050 and set:
-- Vault folder
-- Top-K related notes
-- Similarity threshold
-- Cyber domains folder name
+Opens **http://127.0.0.1:5050** automatically.
 
-## How it works (high level)
-1. Reads each note and scores keywords against the taxonomy.
-2. Assigns one primary topic and any matching cyber domains.
-3. Adds tags/domains to frontmatter and appends an auto-managed block.
-4. Builds `MOC.md` plus `cyber domains/Cyber Domains MOC.md`.
-5. For PDF/DOCX, writes a sidecar `.index.md` note.
+---
+
+## Using the Dashboard
+
+### Run tab
+1. Paste your vault path in **Vault folder** — a ✓ confirms the path exists.
+2. Adjust **Top-K**, **Threshold**, and options as needed.
+3. Click **Dry Run** to preview, then **Apply Changes** to write (a backup is created automatically).
+4. Use **Clean (preview / apply)** to remove everything the tool added.
+5. **Stop Scan** cancels a running operation. **Shut down** stops the server.
+
+### Taxonomy tab
+- Search topics or keywords using the filter box above each column.
+- Click a topic name to rename it (Enter to save, Escape to cancel).
+- Add/remove keywords with the chips below each topic.
+- Use **+ New Topic / + New Domain** to create entries.
+
+### Folders tab
+- **Refresh** to detect vault folders and their file counts.
+- **Add domain** — register a folder as a cyber domain.
+- **Exclude** — skip a folder from tag generation.
+- **Rename tag / Remove tag** — control folder-derived tag slugs.
+- **Clear rules** — reset all exclude/rename rules.
+- **Remove all folder tags** — strip folder tags from every note.
+
+---
+
+## CLI (optional)
+
+```bash
+# Preview only (no writes)
+python obsidian_reorganize.py "D:\path\to\vault"
+
+# Write changes (creates backup first)
+python obsidian_reorganize.py "D:\path\to\vault" --apply
+
+# Remove everything the tool added
+python obsidian_reorganize.py "D:\path\to\vault" --clean --apply
+```
+
+---
 
 ## Notes
-- The tool is safe by default: dry-run and idempotent updates.
-- `taxonomy.json` is the source of truth once created; edit it to tune keywords.
-- Backups are created on apply in the v1 script; v2 focuses on taxonomy + sidecars.
 
-## License
-Add your license here.
+- Everything runs locally — nothing leaves your machine.
+- `taxonomy.json` is auto-created on first run; edit it to tune keywords.
+- Every write operation backs up your vault before touching anything.
