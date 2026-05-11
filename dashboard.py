@@ -927,27 +927,47 @@ HTML = r"""
 
   /* organize / drag-drop */
   .file-dot{
-    width:14px; height:14px; border-radius:50%;
-    display:inline-block; margin:3px; cursor:grab;
-    border:2px solid transparent; vertical-align:middle;
+    width:9px; height:9px; border-radius:50%;
+    display:inline-block; flex-shrink:0;
+    border:2px solid transparent;
     transition:transform 0.1s;
   }
-  .file-dot:hover{transform:scale(1.3)}
-  .file-dot:active{cursor:grabbing}
   .file-dot.suggested{border-style:dashed; border-color:var(--muted)}
   .file-dot.staged{border-color:var(--accent); border-style:solid}
   .file-dot.pending{box-shadow:0 0 0 2px gold}
   .file-dot.placed{border-color:var(--ok); border-style:solid}
 
+  .file-row{
+    display:flex; align-items:center; gap:7px;
+    padding:3px 8px; margin:2px 0;
+    background:var(--panel2); border:1px solid var(--border);
+    border-radius:4px; cursor:grab;
+    font-family:var(--mono); font-size:12px; color:#d4d4d4;
+    user-select:none; max-width:100%;
+    transition:background 0.1s, border-color 0.1s;
+  }
+  .file-row:hover{background:#2a2a2a; border-color:var(--accent)}
+  .file-row:active{cursor:grabbing}
+  .file-row .file-name{
+    flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .file-row.dragging{opacity:0.4}
+
   .folder-group{margin-bottom:10px}
   .folder-group-head{
     display:flex; align-items:center; gap:6px;
-    font-size:12px; color:var(--muted); margin-bottom:4px;
-    cursor:pointer; user-select:none;
+    font-size:12px; color:var(--muted); margin-bottom:6px;
+    cursor:pointer; user-select:none; padding:3px 0;
+    border-bottom:1px solid var(--border);
   }
   .folder-group-head:hover{color:var(--text)}
-  .folder-group-body{padding-left:14px; line-height:1.8}
+  .folder-group-head .folder-path{
+    font-family:var(--mono); color:var(--accent);
+  }
+  .folder-group-body{padding-left:6px}
   .folder-group.collapsed .folder-group-body{display:none}
+  .folder-group.collapsed .folder-group-head .caret{transform:rotate(-90deg)}
+  .folder-group-head .caret{display:inline-block; transition:transform 0.1s}
 
   .domain-grid{
     display:grid; grid-template-columns:repeat(auto-fill, minmax(180px, 1fr));
@@ -961,7 +981,7 @@ HTML = r"""
   .domain-bin.dragover{background:#2a2440; border-color:var(--accent); border-style:solid}
   .domain-bin-name{font-size:12px; font-weight:600; color:var(--muted);
                    margin-bottom:6px; text-transform:uppercase; letter-spacing:0.4px}
-  .domain-bin-body{min-height:30px; display:flex; flex-wrap:wrap}
+  .domain-bin-body{min-height:30px; max-height:240px; overflow:auto}
 
   .pending-row{
     display:flex; align-items:center; gap:8px;
@@ -1417,16 +1437,23 @@ const ORG = {
     }
     const byFolder = {};
     for (const f of this.files) (byFolder[f.folder] = byFolder[f.folder] || []).push(f);
+    // Sort folders so subfolders nest near their parents
     const folders = Object.keys(byFolder).sort((a,b) => a.localeCompare(b));
     container.innerHTML = folders.map(folder => {
-      const items = byFolder[folder];
-      const dots = items.map(f => this._dotHTML(f)).join('');
+      const items = byFolder[folder].slice().sort((a,b) =>
+        a.path.split('/').pop().toLowerCase().localeCompare(b.path.split('/').pop().toLowerCase())
+      );
+      const rows = items.map(f => this._rowHTML(f)).join('');
+      // collapse very large folders by default
+      const collapsed = items.length > 50 ? ' collapsed' : '';
       return `
-        <div class="folder-group" data-folder="${escape(folder)}">
+        <div class="folder-group${collapsed}" data-folder="${escape(folder)}">
           <div class="folder-group-head" onclick="this.parentNode.classList.toggle('collapsed')">
-            <span>▾</span><span>${escape(folder)}</span><span style="opacity:0.6">(${items.length})</span>
+            <span class="caret">▾</span>
+            <span class="folder-path">${escape(folder)}</span>
+            <span style="opacity:0.6">(${items.length})</span>
           </div>
-          <div class="folder-group-body">${dots}</div>
+          <div class="folder-group-body">${rows}</div>
         </div>`;
     }).join('');
     this._wireDragSources();
@@ -1446,39 +1473,48 @@ const ORG = {
       if (b && inBin[b]) inBin[b].push(f);
     }
     container.innerHTML = this.domains.map(d => {
-      const dots = inBin[d].map(f => this._dotHTML(f)).join('') || '<span class="empty">drop here</span>';
+      const items = inBin[d].slice().sort((a,b) =>
+        a.path.split('/').pop().toLowerCase().localeCompare(b.path.split('/').pop().toLowerCase())
+      );
+      const rows = items.map(f => this._rowHTML(f)).join('')
+                   || '<span class="empty">drop here</span>';
       return `
         <div class="domain-bin" data-domain="${escape(d)}"
              ondragover="ORG.onDragOver(event)"
              ondragleave="ORG.onDragLeave(event)"
              ondrop="ORG.onDrop(event, '${escape(d).replace(/'/g, "\\'")}')">
-          <div class="domain-bin-name">${escape(d)}</div>
-          <div class="domain-bin-body">${dots}</div>
+          <div class="domain-bin-name">${escape(d)} <span style="opacity:0.5">(${items.length})</span></div>
+          <div class="domain-bin-body">${rows}</div>
         </div>`;
     }).join('');
     this._wireDragSources();
   },
 
-  _dotHTML(f) {
-    let cls = 'file-dot';
-    if (this.staged[f.path])             cls += ' pending';
-    else if (f.already_in_domain)         cls += ' placed';
-    else if (this.binFor[f.path])         cls += ' suggested';
+  _rowHTML(f) {
+    let dotCls = 'file-dot';
+    if (this.staged[f.path])             dotCls += ' pending';
+    else if (f.already_in_domain)         dotCls += ' placed';
+    else if (this.binFor[f.path])         dotCls += ' suggested';
     const color = this.hashColor(f.primary || 'Uncategorized');
+    const filename = f.path.split('/').pop();
     const tip = `${f.path}\nPrimary: ${f.primary}\nDomains: ${(f.domains||[]).join(', ') || 'none'}` +
                 (f.already_in_domain ? `\nAlready placed in: ${f.already_in_domain}` : '');
-    return `<span class="${cls}" style="background:${color}"
-             draggable="true"
+    return `<div class="file-row" draggable="true"
              data-path="${escape(f.path)}"
-             title="${escape(tip)}"></span>`;
+             title="${escape(tip)}">
+              <span class="${dotCls}" style="background:${color}"></span>
+              <span class="file-name">${escape(filename)}</span>
+            </div>`;
   },
 
   _wireDragSources() {
-    document.querySelectorAll('.file-dot[draggable=true]').forEach(el => {
+    document.querySelectorAll('.file-row[draggable=true]').forEach(el => {
       el.ondragstart = (e) => {
         e.dataTransfer.setData('text/plain', el.dataset.path);
         e.dataTransfer.effectAllowed = 'copyMove';
+        el.classList.add('dragging');
       };
+      el.ondragend = () => el.classList.remove('dragging');
     });
   },
 

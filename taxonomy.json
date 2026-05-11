@@ -50,7 +50,12 @@
     ],
     "Tools": [
       "tools",
-      "tool"
+      "tool",
+      "snort",
+      "nmap",
+      "wirsharck",
+      "john",
+      "netcat"
     ],
     "Notion": [
       "notion"
@@ -346,12 +351,23 @@
       "java",
       "c",
       "c++",
-      "cpp"
-    ]
+      "cpp",
+      "Javascript",
+      "HTMl",
+      "html",
+      "css"
+    ],
+    "AI LLM attack": [
+      "AI",
+      "ai",
+      "llm",
+      "LLM"
+    ],
+    "DB Sec": []
   },
   "folder_rules": {
     "exclude": [],
     "rename": {},
-    "depth": "top"
+    "depth": "all"
   }
 }

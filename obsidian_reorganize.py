@@ -39,6 +39,7 @@ Dependencies
 """
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -735,26 +736,92 @@ def apply_domain_to_files(vault: Path, file_paths: list, domain: str,
     return {'changed': changed, 'skipped': skipped}
 
 
+SCAN_CACHE_NAME = '.bmt-scan-cache.json'
+
+
+def _taxonomy_hash(primary_topics, cyber_domains) -> str:
+    """Short hash of the taxonomy used to invalidate the scan cache."""
+    s = json.dumps([primary_topics, cyber_domains], sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(s.encode('utf-8')).hexdigest()[:16]
+
+
 def preview_scan(vault: Path, cyber_root: Path, primary_topics, cyber_domains,
-                 folder_rules, single_domain: bool = False) -> dict:
+                 folder_rules, single_domain: bool = False,
+                 use_cache: bool = True) -> dict:
     """Classify every vault file WITHOUT writing anything.
 
-    Returns a structured dict the dashboard can render directly:
+    Optimizations:
+      1. Filename-only scoring (no file body read).
+      2. Pre-lowercased keyword lists (computed once, reused for every file).
+      3. Per-file mtime + size cache keyed by taxonomy hash.
+         Stored at <vault>/.bmt-scan-cache.json.
+
+    Returns:
       {
-        'files': [{
-            'path': 'subfolder/note.md',
-            'folder': 'subfolder' or '(root)',
-            'primary': 'Linux' or 'Uncategorized',
-            'domains': ['Cloud Security', ...],
-            'already_in_domain': 'Cloud Security' or None,
-        }, ...],
-        'folders': ['(root)', 'subfolder1', 'subfolder2', ...],
-        'domains': [<sorted list of all available domain names>],
+        'files': [{path, folder, primary, domains, already_in_domain}, ...],
+        'folders': [...],
+        'domains': [...],
       }
     """
+    # ---- 2. Pre-lowercase keyword lists once -------------------------------
+    pt_low = {topic: [kw.lower() for kw in kws]
+              for topic, kws in primary_topics.items()}
+    cd_low = {domain: [kw.lower() for kw in kws]
+              for domain, kws in cyber_domains.items()}
+
+    def _classify(hay: str):
+        # filename haystack is already lowercased + space-padded
+        # primary: pick the topic with the highest score (or 'Uncategorized')
+        best_topic = None
+        best_score = 0
+        for topic, kws in pt_low.items():
+            score = 0
+            for kw in kws:
+                if kw in hay:
+                    score += hay.count(kw)
+            if score > best_score:
+                best_score = score
+                best_topic = topic
+        primary = best_topic or 'Uncategorized'
+
+        # domains: every domain with any keyword match
+        matches = []
+        best_domain = None
+        best_domain_score = 0
+        for domain, kws in cd_low.items():
+            score = 0
+            for kw in kws:
+                if kw in hay:
+                    score += hay.count(kw)
+            if score > 0:
+                matches.append(domain)
+                if score > best_domain_score:
+                    best_domain_score = score
+                    best_domain = domain
+
+        if single_domain:
+            domains = [best_domain] if best_domain else []
+        else:
+            domains = matches
+        return primary, domains
+
+    # ---- 3. Load existing cache --------------------------------------------
+    cache_path = vault / SCAN_CACHE_NAME
+    tax_hash = _taxonomy_hash(primary_topics, cyber_domains)
+    cached_files = {}
+    if use_cache and cache_path.exists():
+        try:
+            raw = json.loads(cache_path.read_text(encoding='utf-8'))
+            if (raw.get('taxonomy_hash') == tax_hash
+                    and raw.get('single_domain') == single_domain):
+                cached_files = raw.get('files', {}) or {}
+        except Exception:
+            cached_files = {}
+
     files = []
     folders_seen = set()
     cyber_folder_name = cyber_root.name
+    new_cache_files = {}
 
     for p in discover(vault, cyber_root):
         try:
@@ -764,18 +831,19 @@ def preview_scan(vault: Path, cyber_root: Path, primary_topics, cyber_domains,
 
         rel_str = str(rel).replace('\\', '/')
         parent_parts = rel.parent.parts
-        folder = parent_parts[0] if parent_parts else '(root)'
+        parent_str = '/'.join(parent_parts) if parent_parts else ''
+        folder = parent_str if parent_str and parent_str != '.' else '(root)'
         folders_seen.add(folder)
 
+        # Cheap stat — single syscall.
         try:
-            hay = build_haystack(p)
-        except Exception:
-            hay = f' {p.stem} '.lower()
+            st = p.stat()
+        except OSError:
+            continue
+        mtime = st.st_mtime
+        size = st.st_size
 
-        primary = assign_primary(hay, primary_topics)
-        domains = assign_domains(hay, cyber_domains, single_domain=single_domain)
-
-        # Detect "already placed" — file lives under <cyber_folder>/<domain>/...
+        # Detect "already placed" once per file (cheap, path-based).
         already = None
         if len(parent_parts) >= 2 and parent_parts[0] == cyber_folder_name:
             domain_dir = parent_parts[1]
@@ -784,6 +852,24 @@ def preview_scan(vault: Path, cyber_root: Path, primary_topics, cyber_domains,
                     already = d
                     break
 
+        # ---- cache hit? ----
+        c = cached_files.get(rel_str)
+        if c and c.get('mtime') == mtime and c.get('size') == size:
+            primary = c.get('primary', 'Uncategorized')
+            domains = c.get('domains', []) or []
+        else:
+            # 1. Filename-only haystack.
+            stem = p.stem.lower().replace('_', ' ').replace('-', ' ')
+            hay = f' {stem} '
+            primary, domains = _classify(hay)
+
+        new_cache_files[rel_str] = {
+            'mtime': mtime,
+            'size': size,
+            'primary': primary,
+            'domains': domains,
+        }
+
         files.append({
             'path': rel_str,
             'folder': folder,
@@ -791,6 +877,17 @@ def preview_scan(vault: Path, cyber_root: Path, primary_topics, cyber_domains,
             'domains': domains,
             'already_in_domain': already,
         })
+
+    # ---- write fresh cache (silently swallow write errors) -----------------
+    if use_cache:
+        try:
+            cache_path.write_text(json.dumps({
+                'taxonomy_hash': tax_hash,
+                'single_domain': single_domain,
+                'files': new_cache_files,
+            }, ensure_ascii=False), encoding='utf-8')
+        except Exception:
+            pass
 
     return {
         'files': files,
