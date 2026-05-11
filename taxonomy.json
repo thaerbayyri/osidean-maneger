@@ -142,6 +142,11 @@
       "side project",
       "project plan",
       "project notes"
+    ],
+    "Writeup": [
+      "writeup",
+      "write up",
+      "write-up"
     ]
   },
   "cyber_domains": {
@@ -335,7 +340,14 @@
       "data masking"
     ],
     "CTF": [],
-    "coding": []
+    "coding": [
+      "python",
+      "bash",
+      "java",
+      "c",
+      "c++",
+      "cpp"
+    ]
   },
   "folder_rules": {
     "exclude": [],

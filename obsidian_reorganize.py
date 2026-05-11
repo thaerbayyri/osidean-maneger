@@ -735,6 +735,70 @@ def apply_domain_to_files(vault: Path, file_paths: list, domain: str,
     return {'changed': changed, 'skipped': skipped}
 
 
+def preview_scan(vault: Path, cyber_root: Path, primary_topics, cyber_domains,
+                 folder_rules, single_domain: bool = False) -> dict:
+    """Classify every vault file WITHOUT writing anything.
+
+    Returns a structured dict the dashboard can render directly:
+      {
+        'files': [{
+            'path': 'subfolder/note.md',
+            'folder': 'subfolder' or '(root)',
+            'primary': 'Linux' or 'Uncategorized',
+            'domains': ['Cloud Security', ...],
+            'already_in_domain': 'Cloud Security' or None,
+        }, ...],
+        'folders': ['(root)', 'subfolder1', 'subfolder2', ...],
+        'domains': [<sorted list of all available domain names>],
+      }
+    """
+    files = []
+    folders_seen = set()
+    cyber_folder_name = cyber_root.name
+
+    for p in discover(vault, cyber_root):
+        try:
+            rel = p.relative_to(vault)
+        except Exception:
+            continue
+
+        rel_str = str(rel).replace('\\', '/')
+        parent_parts = rel.parent.parts
+        folder = parent_parts[0] if parent_parts else '(root)'
+        folders_seen.add(folder)
+
+        try:
+            hay = build_haystack(p)
+        except Exception:
+            hay = f' {p.stem} '.lower()
+
+        primary = assign_primary(hay, primary_topics)
+        domains = assign_domains(hay, cyber_domains, single_domain=single_domain)
+
+        # Detect "already placed" — file lives under <cyber_folder>/<domain>/...
+        already = None
+        if len(parent_parts) >= 2 and parent_parts[0] == cyber_folder_name:
+            domain_dir = parent_parts[1]
+            for d in cyber_domains.keys():
+                if safe_folder_name(d) == domain_dir or d == domain_dir:
+                    already = d
+                    break
+
+        files.append({
+            'path': rel_str,
+            'folder': folder,
+            'primary': primary,
+            'domains': domains,
+            'already_in_domain': already,
+        })
+
+    return {
+        'files': files,
+        'folders': sorted(folders_seen, key=str.lower),
+        'domains': sorted(cyber_domains.keys(), key=str.lower),
+    }
+
+
 # =============================================================================
 # APPLY mode
 # =============================================================================

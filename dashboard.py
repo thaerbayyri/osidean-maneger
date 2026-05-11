@@ -313,6 +313,165 @@ def api_check_vault():
     return jsonify(ok=is_dir, exists=exists, is_dir=is_dir)
 
 
+# ---- organize: scan-preview + per-file move/copy/tag ------------------------
+
+def _unique_dest(dest_dir: Path, filename: str) -> Path:
+    """Return a destination path that doesn't already exist by adding (2), (3)..."""
+    target = dest_dir / filename
+    if not target.exists():
+        return target
+    stem = target.stem
+    suffix = target.suffix
+    i = 2
+    while True:
+        cand = dest_dir / f'{stem} ({i}){suffix}'
+        if not cand.exists():
+            return cand
+        i += 1
+
+
+def _backup_vault(vault: Path) -> Path:
+    """Create a timestamped backup copy of the vault. Returns the backup path."""
+    import shutil as _shutil
+    from datetime import datetime
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup = vault.parent / f'{vault.name}-backup-{ts}'
+    _shutil.copytree(vault, backup)
+    return backup
+
+
+def _do_file_op(vault: Path, src_rel: str, dest_folder: str, mode: str,
+                cyber_folder: str) -> dict:
+    """Perform one file operation. Returns {ok, message, final_path}."""
+    import shutil as _shutil
+    src_rel = (src_rel or '').replace('\\', '/').strip().lstrip('/')
+    dest_folder = (dest_folder or '').strip()
+    if not src_rel or not dest_folder:
+        return {'ok': False, 'message': 'src and dest_folder required'}
+    src = (vault / src_rel)
+    if not src.is_file():
+        return {'ok': False, 'message': f'Source not found: {src_rel}'}
+
+    if mode == 'tag':
+        # Tag-only: add domain to frontmatter, no file movement.
+        try:
+            result = core.apply_domain_to_files(vault, [src_rel], dest_folder,
+                                                make_sidecars=False)
+            ok = result.get('changed', 0) > 0
+            return {'ok': ok,
+                    'message': f'Tagged {dest_folder}' if ok else 'Already tagged',
+                    'final_path': src_rel}
+        except Exception as e:
+            return {'ok': False, 'message': f'{type(e).__name__}: {e}'}
+
+    # move / copy: physically place the file in <cyber_folder>/<dest_folder>/
+    target_dir = vault / cyber_folder / core.safe_folder_name(dest_folder)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = _unique_dest(target_dir, src.name)
+    try:
+        if mode == 'move':
+            _shutil.move(str(src), str(target))
+            action = 'Moved'
+        elif mode == 'copy':
+            _shutil.copy2(str(src), str(target))
+            action = 'Copied'
+        else:
+            return {'ok': False, 'message': f'Unknown mode: {mode}'}
+    except Exception as e:
+        return {'ok': False, 'message': f'{type(e).__name__}: {e}'}
+
+    final_rel = str(target.relative_to(vault)).replace('\\', '/')
+    return {'ok': True,
+            'message': f'{action} to {final_rel}',
+            'final_path': final_rel}
+
+
+@app.route('/api/scan-preview')
+def api_scan_preview():
+    vault = (request.args.get('vault') or '').strip()
+    cyber_folder = (request.args.get('cyber_folder') or 'domains').strip()
+    single_domain = request.args.get('single_domain', 'false').lower() == 'true'
+    if not vault:
+        return jsonify(ok=False, message='vault is required')
+    vp = Path(vault)
+    if not vp.is_dir():
+        return jsonify(ok=False, message=f'Vault path not found: {vault!r}')
+
+    try:
+        pt, cd, rules = core.load_taxonomy()
+        cyber_root = vp / cyber_folder
+        data = core.preview_scan(vp, cyber_root, pt, cd, rules,
+                                 single_domain=single_domain)
+    except Exception as e:
+        return jsonify(ok=False, message=f'{type(e).__name__}: {e}')
+
+    data['ok'] = True
+    data['cyber_folder'] = cyber_folder
+    return jsonify(data)
+
+
+@app.route('/api/file-op', methods=['POST'])
+def api_file_op():
+    p = request.get_json(force=True) or {}
+    vault = (p.get('vault') or '').strip()
+    cyber_folder = (p.get('cyber_folder') or 'domains').strip()
+    mode = (p.get('mode') or '').strip()
+    src = p.get('src') or ''
+    dest = p.get('dest_folder') or ''
+    if not vault:
+        return jsonify(ok=False, message='vault is required')
+    vp = Path(vault)
+    if not vp.is_dir():
+        return jsonify(ok=False, message=f'Vault path not found: {vault!r}')
+    if mode not in ('move', 'copy', 'tag'):
+        return jsonify(ok=False, message='mode must be move, copy, or tag')
+
+    result = _do_file_op(vp, src, dest, mode, cyber_folder)
+    return jsonify(**result)
+
+
+@app.route('/api/file-ops-batch', methods=['POST'])
+def api_file_ops_batch():
+    p = request.get_json(force=True) or {}
+    vault = (p.get('vault') or '').strip()
+    cyber_folder = (p.get('cyber_folder') or 'domains').strip()
+    ops = p.get('operations') or []
+    if not vault:
+        return jsonify(ok=False, message='vault is required')
+    vp = Path(vault)
+    if not vp.is_dir():
+        return jsonify(ok=False, message=f'Vault path not found: {vault!r}')
+    if not isinstance(ops, list) or not ops:
+        return jsonify(ok=False, message='operations list is required')
+
+    # Backup only if at least one op moves/copies bytes
+    needs_backup = any((op.get('mode') in ('move', 'copy')) for op in ops)
+    backup_path = None
+    if needs_backup:
+        try:
+            backup_path = str(_backup_vault(vp))
+        except Exception as e:
+            return jsonify(ok=False, message=f'Backup failed: {e}')
+
+    results = []
+    applied = 0
+    failed = 0
+    for op in ops:
+        r = _do_file_op(vp, op.get('src', ''), op.get('dest_folder', ''),
+                        op.get('mode', ''), cyber_folder)
+        r['src'] = op.get('src', '')
+        r['dest_folder'] = op.get('dest_folder', '')
+        r['mode'] = op.get('mode', '')
+        results.append(r)
+        if r.get('ok'):
+            applied += 1
+        else:
+            failed += 1
+
+    return jsonify(ok=True, applied=applied, failed=failed,
+                   backup=backup_path, results=results)
+
+
 @app.route('/api/keyword', methods=['POST'])
 def api_keyword():
     p = request.get_json(force=True) or {}
@@ -765,6 +924,77 @@ HTML = r"""
   }
   .tax-search-clear:hover{color:var(--text)}
   .topic-card.hidden{display:none}
+
+  /* organize / drag-drop */
+  .file-dot{
+    width:14px; height:14px; border-radius:50%;
+    display:inline-block; margin:3px; cursor:grab;
+    border:2px solid transparent; vertical-align:middle;
+    transition:transform 0.1s;
+  }
+  .file-dot:hover{transform:scale(1.3)}
+  .file-dot:active{cursor:grabbing}
+  .file-dot.suggested{border-style:dashed; border-color:var(--muted)}
+  .file-dot.staged{border-color:var(--accent); border-style:solid}
+  .file-dot.pending{box-shadow:0 0 0 2px gold}
+  .file-dot.placed{border-color:var(--ok); border-style:solid}
+
+  .folder-group{margin-bottom:10px}
+  .folder-group-head{
+    display:flex; align-items:center; gap:6px;
+    font-size:12px; color:var(--muted); margin-bottom:4px;
+    cursor:pointer; user-select:none;
+  }
+  .folder-group-head:hover{color:var(--text)}
+  .folder-group-body{padding-left:14px; line-height:1.8}
+  .folder-group.collapsed .folder-group-body{display:none}
+
+  .domain-grid{
+    display:grid; grid-template-columns:repeat(auto-fill, minmax(180px, 1fr));
+    gap:10px;
+  }
+  .domain-bin{
+    min-height:80px; padding:8px 10px;
+    border:1px dashed var(--border); border-radius:6px;
+    background:var(--panel2);
+  }
+  .domain-bin.dragover{background:#2a2440; border-color:var(--accent); border-style:solid}
+  .domain-bin-name{font-size:12px; font-weight:600; color:var(--muted);
+                   margin-bottom:6px; text-transform:uppercase; letter-spacing:0.4px}
+  .domain-bin-body{min-height:30px; display:flex; flex-wrap:wrap}
+
+  .pending-row{
+    display:flex; align-items:center; gap:8px;
+    padding:6px 10px; background:var(--panel2);
+    border:1px solid var(--border); border-radius:5px;
+    margin-bottom:6px; font-size:12.5px; font-family:var(--mono);
+  }
+  .pending-row .mode-tag{
+    padding:1px 7px; border-radius:10px; font-size:11px;
+    background:var(--border); color:var(--text);
+  }
+  .pending-row .mode-tag.move{background:#7c5cff; color:white}
+  .pending-row .mode-tag.copy{background:var(--warn); color:#000}
+  .pending-row .mode-tag.tag{background:var(--ok); color:#000}
+  .pending-row .pending-x{
+    margin-left:auto; background:transparent; border:0; color:var(--muted);
+    cursor:pointer; font-size:16px; line-height:1; padding:0 4px;
+  }
+  .pending-row .pending-x:hover{color:var(--danger)}
+  .pending-row.ok{border-color:var(--ok)}
+  .pending-row.err{border-color:var(--danger)}
+
+  .op-modal{
+    position:fixed; inset:0; background:rgba(0,0,0,0.65);
+    display:none; align-items:center; justify-content:center; z-index:2000;
+  }
+  .op-modal.show{display:flex}
+  .op-modal-inner{
+    background:var(--panel); border:1px solid var(--border);
+    border-radius:8px; padding:24px; min-width:420px;
+    box-shadow:0 8px 32px rgba(0,0,0,0.5);
+  }
+  .op-modal-title{font-size:14px; color:var(--text); text-align:center}
 </style>
 </head>
 <body>
@@ -808,8 +1038,8 @@ HTML = r"""
           <input type="number" id="threshold" value="{{ config.threshold }}" step="0.01" min="0" max="1" />
         </div>
         <div>
-          <label for="cyber_folder">domains folder name</label>
-          <input type="text" id="cyber_folder" value="{{ config.cyber_folder }}" />
+          <label for="cyber_folder">Domain folder name</label>
+          <input type="text" id="cyber_folder" value="{{ config.cyber_folder }}" placeholder="domains" />
         </div>
         <div style="flex:0 0 auto; padding-bottom:9px">
           <label class="checkbox">
@@ -826,7 +1056,7 @@ HTML = r"""
           </label>
           <label class="checkbox" style="margin-top:6px">
             <input type="checkbox" id="single_domain" {% if config.single_domain %}checked{% endif %} />
-            <span>Single cyber domain only</span>
+            <span>Single domain only</span>
           </label>
         </div>
       </div>
@@ -843,7 +1073,7 @@ HTML = r"""
       </div>
       <div class="help" style="margin-top:10px">
         <strong>Dry Run</strong> shows the topic plan without writing anything. &nbsp;
-        <strong>Apply</strong> backs up your vault, then writes tags, links, MOC, and the cyber-domains folder. &nbsp;
+        <strong>Apply</strong> backs up your vault, then writes tags, links, MOC, and the domain folder. &nbsp;
         <strong>Clean</strong> removes everything this tool added. If folder tags are enabled, it also removes
         those slugs from <code>tags:</code>.
       </div>
@@ -878,7 +1108,7 @@ HTML = r"""
       </div>
       <div class="tax-col">
         <h2>
-          Cyber Domains
+          Domains
           <button class="add-topic" onclick="addTopic('domain')">+ New Domain</button>
         </h2>
         <div class="tax-search-wrap">
@@ -920,37 +1150,69 @@ HTML = r"""
       <div id="folder-list"></div>
     </div>
 
+    <!-- Card A: Organize — scan controls -->
     <div class="card">
-      <label>Manual domain assignment</label>
+      <label>Organize · drag &amp; drop files into domains</label>
       <div class="row" style="margin-top:6px">
         <div style="flex:0 0 260px">
-          <label for="domain_folder">Folder</label>
-          <select id="domain_folder" style="width:100%; padding:9px 12px; background:var(--panel2); color:var(--text); border:1px solid var(--border); border-radius:6px;"></select>
+          <label for="org_folder">Domain folder name</label>
+          <input type="text" id="org_folder" placeholder="domains" />
         </div>
-        <div>
-          <label for="domain_name">Domain name</label>
-          <input type="text" id="domain_name" placeholder="e.g. Cloud Security" />
-        </div>
-        <div style="flex:0 0 auto; padding-bottom:9px">
-          <label class="checkbox">
-            <input type="checkbox" id="create_domain" checked />
-            <span>Create domain if missing</span>
-          </label>
+        <div style="flex:1; padding-bottom:9px">
+          <label>&nbsp;</label>
+          <div class="btn-row" style="margin-top:0">
+            <button class="btn primary" onclick="ORG.scan()">Scan vault</button>
+            <button class="btn" onclick="ORG.resetSuggestions()">Reset to suggestions</button>
+          </div>
         </div>
       </div>
-      <div class="btn-row" style="margin-top:10px">
-        <button class="btn" onclick="loadFolderList()">Refresh folders</button>
-        <button class="btn" onclick="loadFolderFiles()">Load files</button>
-        <button class="btn primary" onclick="applyDomainToFiles()">Apply domain to selected files</button>
+      <div class="help" style="margin-top:8px">
+        <span style="display:inline-flex; align-items:center; gap:5px; margin-right:14px"><span class="file-dot suggested" style="background:#7c5cff"></span> suggested</span>
+        <span style="display:inline-flex; align-items:center; gap:5px; margin-right:14px"><span class="file-dot staged" style="background:#7c5cff"></span> staged</span>
+        <span style="display:inline-flex; align-items:center; gap:5px"><span class="file-dot pending" style="background:#7c5cff"></span> pending operation</span>
       </div>
-      <div class="help">Choose a folder, set the domain name, select files below, then apply.</div>
+      <div class="help" id="org-status" style="margin-top:6px"></div>
     </div>
 
+    <!-- Card B: files grouped by source folder -->
     <div class="card">
-      <label>Files in folder</label>
-      <div id="folder-files" style="max-height:360px; overflow:auto;"></div>
+      <label>Files by source folder</label>
+      <div id="org-files" style="max-height:300px; overflow:auto">
+        <div class="empty">Click <strong>Scan vault</strong> to load files.</div>
+      </div>
+    </div>
+
+    <!-- Card C: domain drop bins -->
+    <div class="card">
+      <label>Domains (drop targets)</label>
+      <div id="org-bins" class="domain-grid">
+        <div class="empty">Run a scan to load domain bins.</div>
+      </div>
+    </div>
+
+    <!-- Card D: pending operations queue -->
+    <div class="card">
+      <label>Pending operations</label>
+      <div id="org-pending"><div class="empty">No pending operations.</div></div>
+      <div class="btn-row" style="margin-top:10px">
+        <button class="btn primary" onclick="ORG.applyPending()" id="org-apply-btn" disabled>Apply pending (0)</button>
+        <button class="btn" onclick="ORG.clearPending()">Clear</button>
+      </div>
     </div>
   </section>
+
+  <!-- Drop-action modal -->
+  <div id="op-modal" class="op-modal">
+    <div class="op-modal-inner">
+      <div class="op-modal-title" id="op-modal-title">Drop file</div>
+      <div class="btn-row" style="margin-top:14px; justify-content:center; gap:8px">
+        <button class="btn primary" onclick="ORG.modalChoose('move')">Move file</button>
+        <button class="btn" onclick="ORG.modalChoose('copy')">Copy file</button>
+        <button class="btn" onclick="ORG.modalChoose('tag')">Tag only</button>
+        <button class="btn danger" onclick="ORG.modalChoose(null)">Cancel</button>
+      </div>
+    </div>
+  </div>
 
 </main>
 
@@ -1059,59 +1321,305 @@ async function loadFolders() {
   renderFolders(data.folders || []);
 }
 
-async function loadFolderList() {
-  const vault = document.getElementById('vault').value.trim();
-  if (!vault) { toast('Set the vault path first', false); return; }
-  const cyber_folder = document.getElementById('cyber_folder').value.trim();
-  const r = await fetch('/api/folder-list?vault=' + encodeURIComponent(vault) +
-                        '&cyber_folder=' + encodeURIComponent(cyber_folder));
-  const data = await r.json();
-  if (!data.ok) { toast(data.message || 'Failed to load folders', false); return; }
-  const sel = document.getElementById('domain_folder');
-  sel.innerHTML = data.folders.map(f => `<option value="${escape(f)}">${escape(f)}</option>`).join('');
-  if (data.folders.length) {
-    document.getElementById('domain_name').value = data.folders[0];
-  }
-}
+// -------- ORG: scan-preview + drag-drop file organizer --------
+const ORG = {
+  files: [],           // [{path, folder, primary, domains, already_in_domain}]
+  domains: [],         // sorted list of all domain names
+  folders: [],         // sorted source-folder names
+  binFor: {},          // path -> bin name ('' if no bin)
+  staged: {},          // path -> {dest, mode}
+  pending: [],         // [{src, dest_folder, mode}]
+  topicColors: {},
+  _modal: { resolve: null, src: null, dest: null },
 
-async function loadFolderFiles() {
-  const vault = document.getElementById('vault').value.trim();
-  const folder = document.getElementById('domain_folder').value;
-  const cyber_folder = document.getElementById('cyber_folder').value.trim();
-  if (!vault || !folder) { toast('Set the vault path and folder', false); return; }
-  const r = await fetch('/api/files-in-folder?vault=' + encodeURIComponent(vault) +
-                        '&folder=' + encodeURIComponent(folder) +
-                        '&cyber_folder=' + encodeURIComponent(cyber_folder));
-  const data = await r.json();
-  if (!data.ok) { toast(data.message || 'Failed to load files', false); return; }
-  const container = document.getElementById('folder-files');
-  if (!data.files.length) {
-    container.innerHTML = '<div class="empty">No files found.</div>';
-    return;
-  }
-  container.innerHTML = data.files.map(f => `
-    <label class="checkbox" style="margin-bottom:6px">
-      <input type="checkbox" class="file-check" value="${escape(f)}" />
-      <span>${escape(f)}</span>
-    </label>
-  `).join('');
-}
+  hashColor(s) {
+    if (this.topicColors[s]) return this.topicColors[s];
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+    const hue = h % 360;
+    const c = `hsl(${hue} 65% 55%)`;
+    this.topicColors[s] = c;
+    return c;
+  },
 
-async function applyDomainToFiles() {
-  const vault = document.getElementById('vault').value.trim();
-  const domain = document.getElementById('domain_name').value.trim();
-  const create_domain = document.getElementById('create_domain').checked;
-  if (!vault || !domain) { toast('Set vault and domain name', false); return; }
-  const files = Array.from(document.querySelectorAll('.file-check:checked'))
-    .map(c => c.value);
-  if (!files.length) { toast('Select at least one file', false); return; }
-  const r = await fetch('/api/assign-domain', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({vault, domain, files, create_domain})
-  });
-  const data = await r.json();
-  toast(data.message, data.ok);
-}
+  _vault() { return document.getElementById('vault').value.trim(); },
+  _cyberFolder() {
+    // Use Organize tab's folder field if set; else fall back to Run tab's value
+    const v = document.getElementById('org_folder').value.trim();
+    return v || document.getElementById('cyber_folder').value.trim() || 'domains';
+  },
+
+  async scan() {
+    const vault = this._vault();
+    if (!vault) { toast('Set the vault path first', false); return; }
+    const folder = this._cyberFolder();
+    const status = document.getElementById('org-status');
+    status.textContent = 'Scanning...';
+    try {
+      const r = await fetch('/api/scan-preview?vault=' + encodeURIComponent(vault)
+                            + '&cyber_folder=' + encodeURIComponent(folder));
+      const d = await r.json();
+      if (!d.ok) { toast(d.message || 'Scan failed', false); status.textContent = ''; return; }
+      // Sync the Run tab's cyber_folder field so both stay in sync
+      document.getElementById('cyber_folder').value = folder;
+      this.files = d.files || [];
+      this.domains = d.domains || [];
+      this.folders = d.folders || [];
+      this.binFor = {};
+      this.staged = {};
+      this.pending = [];
+      // Auto-place: suggest first matching domain; or use already_in_domain
+      for (const f of this.files) {
+        if (f.already_in_domain) this.binFor[f.path] = f.already_in_domain;
+        else if (f.domains && f.domains.length) this.binFor[f.path] = f.domains[0];
+        else this.binFor[f.path] = '';
+      }
+      this.renderAll();
+    } catch (e) {
+      toast('Scan error: ' + e.message, false);
+      status.textContent = '';
+    }
+  },
+
+  resetSuggestions() {
+    if (!this.files.length) { toast('Run a scan first', false); return; }
+    this.binFor = {};
+    this.staged = {};
+    this.pending = [];
+    for (const f of this.files) {
+      if (f.already_in_domain) this.binFor[f.path] = f.already_in_domain;
+      else if (f.domains && f.domains.length) this.binFor[f.path] = f.domains[0];
+      else this.binFor[f.path] = '';
+    }
+    this.renderAll();
+  },
+
+  renderAll() {
+    this.renderStatus();
+    this.renderFiles();
+    this.renderBins();
+    this.renderPending();
+  },
+
+  renderStatus() {
+    const total = this.files.length;
+    const suggested = this.files.filter(f => !f.already_in_domain && this.binFor[f.path]).length;
+    const staged = Object.keys(this.staged).length;
+    document.getElementById('org-status').textContent =
+      `${total} files scanned · ${suggested} suggested · ${staged} staged · ${this.pending.length} pending`;
+  },
+
+  renderFiles() {
+    const container = document.getElementById('org-files');
+    if (!this.files.length) {
+      container.innerHTML = '<div class="empty">No files found in vault.</div>';
+      return;
+    }
+    const byFolder = {};
+    for (const f of this.files) (byFolder[f.folder] = byFolder[f.folder] || []).push(f);
+    const folders = Object.keys(byFolder).sort((a,b) => a.localeCompare(b));
+    container.innerHTML = folders.map(folder => {
+      const items = byFolder[folder];
+      const dots = items.map(f => this._dotHTML(f)).join('');
+      return `
+        <div class="folder-group" data-folder="${escape(folder)}">
+          <div class="folder-group-head" onclick="this.parentNode.classList.toggle('collapsed')">
+            <span>▾</span><span>${escape(folder)}</span><span style="opacity:0.6">(${items.length})</span>
+          </div>
+          <div class="folder-group-body">${dots}</div>
+        </div>`;
+    }).join('');
+    this._wireDragSources();
+  },
+
+  renderBins() {
+    const container = document.getElementById('org-bins');
+    if (!this.domains.length) {
+      container.innerHTML = '<div class="empty">No domains in taxonomy.</div>';
+      return;
+    }
+    // group files by current bin assignment
+    const inBin = {};
+    for (const d of this.domains) inBin[d] = [];
+    for (const f of this.files) {
+      const b = this.binFor[f.path];
+      if (b && inBin[b]) inBin[b].push(f);
+    }
+    container.innerHTML = this.domains.map(d => {
+      const dots = inBin[d].map(f => this._dotHTML(f)).join('') || '<span class="empty">drop here</span>';
+      return `
+        <div class="domain-bin" data-domain="${escape(d)}"
+             ondragover="ORG.onDragOver(event)"
+             ondragleave="ORG.onDragLeave(event)"
+             ondrop="ORG.onDrop(event, '${escape(d).replace(/'/g, "\\'")}')">
+          <div class="domain-bin-name">${escape(d)}</div>
+          <div class="domain-bin-body">${dots}</div>
+        </div>`;
+    }).join('');
+    this._wireDragSources();
+  },
+
+  _dotHTML(f) {
+    let cls = 'file-dot';
+    if (this.staged[f.path])             cls += ' pending';
+    else if (f.already_in_domain)         cls += ' placed';
+    else if (this.binFor[f.path])         cls += ' suggested';
+    const color = this.hashColor(f.primary || 'Uncategorized');
+    const tip = `${f.path}\nPrimary: ${f.primary}\nDomains: ${(f.domains||[]).join(', ') || 'none'}` +
+                (f.already_in_domain ? `\nAlready placed in: ${f.already_in_domain}` : '');
+    return `<span class="${cls}" style="background:${color}"
+             draggable="true"
+             data-path="${escape(f.path)}"
+             title="${escape(tip)}"></span>`;
+  },
+
+  _wireDragSources() {
+    document.querySelectorAll('.file-dot[draggable=true]').forEach(el => {
+      el.ondragstart = (e) => {
+        e.dataTransfer.setData('text/plain', el.dataset.path);
+        e.dataTransfer.effectAllowed = 'copyMove';
+      };
+    });
+  },
+
+  onDragOver(e) { e.preventDefault(); e.currentTarget.classList.add('dragover'); },
+  onDragLeave(e) { e.currentTarget.classList.remove('dragover'); },
+
+  async onDrop(e, domain) {
+    e.preventDefault();
+    e.currentTarget.classList.remove('dragover');
+    const src = e.dataTransfer.getData('text/plain');
+    if (!src) return;
+    const file = this.files.find(f => f.path === src);
+    if (!file) return;
+    // open modal — user picks Move / Copy / Tag / Cancel
+    const mode = await this.askMode(src, domain);
+    if (!mode) return;
+    this.stage(src, domain, mode);
+  },
+
+  askMode(src, domain) {
+    const modal = document.getElementById('op-modal');
+    const filename = src.split('/').pop();
+    document.getElementById('op-modal-title').innerHTML =
+      `Drop <strong>${escape(filename)}</strong> into <strong>${escape(domain)}</strong>`;
+    modal.classList.add('show');
+    this._modal.src = src; this._modal.dest = domain;
+    return new Promise(resolve => { this._modal.resolve = resolve; });
+  },
+
+  modalChoose(mode) {
+    document.getElementById('op-modal').classList.remove('show');
+    if (this._modal.resolve) this._modal.resolve(mode);
+    this._modal.resolve = null;
+  },
+
+  stage(src, domain, mode) {
+    // remove any prior pending op for the same file
+    this.pending = this.pending.filter(o => o.src !== src);
+    this.pending.push({ src, dest_folder: domain, mode });
+    this.staged[src] = { dest: domain, mode };
+    this.binFor[src] = domain;
+    this.renderAll();
+  },
+
+  unstage(src) {
+    this.pending = this.pending.filter(o => o.src !== src);
+    delete this.staged[src];
+    // Restore the previous suggestion
+    const f = this.files.find(x => x.path === src);
+    if (f) {
+      if (f.already_in_domain) this.binFor[src] = f.already_in_domain;
+      else if (f.domains && f.domains.length) this.binFor[src] = f.domains[0];
+      else this.binFor[src] = '';
+    }
+    this.renderAll();
+  },
+
+  clearPending() {
+    if (!this.pending.length) return;
+    for (const op of this.pending) {
+      delete this.staged[op.src];
+      const f = this.files.find(x => x.path === op.src);
+      if (f) {
+        if (f.already_in_domain) this.binFor[op.src] = f.already_in_domain;
+        else if (f.domains && f.domains.length) this.binFor[op.src] = f.domains[0];
+        else this.binFor[op.src] = '';
+      }
+    }
+    this.pending = [];
+    this.renderAll();
+  },
+
+  renderPending() {
+    const container = document.getElementById('org-pending');
+    const btn = document.getElementById('org-apply-btn');
+    if (!this.pending.length) {
+      container.innerHTML = '<div class="empty">No pending operations.</div>';
+      btn.disabled = true;
+      btn.textContent = 'Apply pending (0)';
+      return;
+    }
+    container.innerHTML = this.pending.map((o, i) => `
+      <div class="pending-row" data-i="${i}">
+        <span class="mode-tag ${o.mode}">${o.mode}</span>
+        <span>${escape(o.src.split('/').pop())}</span>
+        <span style="opacity:0.6">→</span>
+        <span>${escape(o.dest_folder)}</span>
+        <button class="pending-x" onclick="ORG.unstage('${escape(o.src).replace(/'/g, "\\'")}')" title="Remove">×</button>
+      </div>`).join('');
+    btn.disabled = false;
+    btn.textContent = `Apply pending (${this.pending.length})`;
+  },
+
+  async applyPending() {
+    if (!this.pending.length) return;
+    const vault = this._vault();
+    if (!vault) { toast('Set the vault path first', false); return; }
+    if (!confirm(`Apply ${this.pending.length} operation(s)?\nA backup will be created if any files move/copy.`)) return;
+    const btn = document.getElementById('org-apply-btn');
+    btn.disabled = true; btn.textContent = 'Applying...';
+    try {
+      const r = await fetch('/api/file-ops-batch', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          vault,
+          cyber_folder: this._cyberFolder(),
+          operations: this.pending,
+        })
+      });
+      const d = await r.json();
+      if (!d.ok) { toast(d.message || 'Batch failed', false); return; }
+      toast(`Applied ${d.applied}, ${d.failed} failed`, d.failed === 0);
+      // Mark rows visually
+      const rows = document.querySelectorAll('#org-pending .pending-row');
+      (d.results || []).forEach((res, i) => {
+        if (rows[i]) rows[i].classList.add(res.ok ? 'ok' : 'err');
+        if (rows[i] && !res.ok) {
+          rows[i].title = res.message || 'failed';
+        }
+      });
+      // Re-scan to pick up the new vault state
+      setTimeout(() => this.scan(), 600);
+    } catch (e) {
+      toast('Apply error: ' + e.message, false);
+    } finally {
+      btn.disabled = false;
+    }
+  },
+};
+
+// Initialize the Organize folder field with the Run tab's value on load
+(function syncOrgFolder() {
+  const orgFolder = document.getElementById('org_folder');
+  const cyberFolder = document.getElementById('cyber_folder');
+  if (orgFolder && cyberFolder && !orgFolder.value) {
+    orgFolder.value = cyberFolder.value || 'domains';
+  }
+  // keep them in sync — editing one updates the other
+  if (orgFolder) orgFolder.addEventListener('input', () => { cyberFolder.value = orgFolder.value; });
+  if (cyberFolder) cyberFolder.addEventListener('input', () => { if (orgFolder) orgFolder.value = cyberFolder.value; });
+})();
 
 document.getElementById('folder_depth').addEventListener('change', async (e) => {
   const depth = e.target.value;
@@ -1360,7 +1868,7 @@ async function commitName(el, kind) {
 }
 
 async function addTopic(kind) {
-  const label = kind === 'primary' ? 'primary topic' : 'cyber domain';
+  const label = kind === 'primary' ? 'primary topic' : 'domain';
   const name = prompt('Name for the new ' + label + ':');
   if (!name || !name.trim()) return;
   const r = await fetch('/api/topic', {
